@@ -113,11 +113,12 @@ pub struct EventBusMetrics {
     /// Per-attach forwarder tasks that exited with `Lagged`. Each one
     /// triggers a client re-attach (and therefore a snapshot or replay).
     pub forwarder_lagged_count: AtomicU64,
-    /// Lifecycle dispatcher try_send fallthrough — a per-connection worker's
-    /// 64-slot mailbox was full at non-terminal-event delivery time, so the
-    /// event was dropped. Sustained nonzero growth means a worker is stuck
-    /// behind a long DB stall; correlate with `lagged_count` to tell apart
-    /// "bus is fast, one worker is slow" vs "bus itself is overloaded".
+    /// Lifecycle dispatcher observed a per-connection worker mailbox at
+    /// capacity and had to block on `send().await` to enqueue. **No event
+    /// is dropped** — the dispatcher waits for the worker to drain. Counts
+    /// each occurrence so operators can spot connections that chronically
+    /// stall their worker (typically a SQLite contention pattern). Distinct
+    /// from `lagged_count` (bus-level event loss).
     pub worker_queue_full_count: AtomicU64,
 }
 

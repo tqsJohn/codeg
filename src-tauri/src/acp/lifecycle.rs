@@ -28,12 +28,34 @@ use crate::acp::session_state::SessionState;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 use tokio::sync::RwLock;
 
-/// Per-connection worker queue depth. Sized to absorb a short DB-stall
-/// burst (a `TurnComplete` blocked on the SQLite write lock for a few
-/// hundred ms while ContentDelta keeps streaming) without forcing the
-/// dispatcher to drop. Per-connection burst is naturally bounded by the
-/// agent's own emit rate; 64 slots ≈ ~6s of headroom even at 10 events/s.
+/// Per-connection worker queue depth. Sized for the **filtered** event set
+/// only (see `is_lifecycle_relevant`) — high-frequency events (ContentDelta,
+/// ToolCall*, PermissionRequest) are dropped at the dispatcher and never
+/// enter the queue. The remaining 5 event types arrive at most a handful
+/// of times per turn, so 64 slots is comfortable headroom for a sustained
+/// SQLite stall without forcing the dispatcher to block on `send`.
 const WORKER_QUEUE_CAPACITY: usize = 64;
+
+/// Whether an event needs to reach the per-connection worker. Mirrors the
+/// match arms in `connection_worker_loop` — keep in sync so the dispatcher
+/// doesn't filter out an event a future worker arm starts caring about.
+///
+/// Filtering at the dispatcher (rather than letting the worker no-op on
+/// uninteresting events) means ContentDelta floods can't crowd out a
+/// TurnComplete in the worker mailbox: only events that may write the DB
+/// or update the per-connection cache enter the queue.
+fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
+    matches!(
+        event,
+        AcpEvent::SessionStarted { .. }
+            | AcpEvent::TurnComplete { .. }
+            | AcpEvent::ConversationLinked { .. }
+            | AcpEvent::StatusChanged {
+                status: ConnectionStatus::Disconnected
+            }
+            | AcpEvent::Error { .. }
+    )
+}
 
 /// Per-connection state that survives `ConnectionCleanupGuard::drop` so
 /// `Disconnected` / `Error` handlers can still emit a derived
@@ -301,10 +323,20 @@ async fn connection_worker_loop(
 }
 
 /// Subscribe to the in-process bus synchronously and return the dispatcher
-/// loop future. The dispatcher fans events out to per-connection worker
-/// tasks so DB-write latency on one connection doesn't backpressure
-/// receiver draining for the others. Within a single connection, ordering
-/// is preserved by the per-worker mpsc.
+/// loop future. Filters out events the lifecycle worker doesn't care about
+/// (high-frequency ContentDelta / ToolCall / PermissionRequest etc.) and
+/// fans the rest out to per-connection worker tasks. Within a single
+/// connection, ordering is preserved by the per-worker mpsc; across
+/// connections, workers run independently so a slow SQLite write on one
+/// connection doesn't backpressure the others.
+///
+/// All forwarded events (the 5 types in `is_lifecycle_relevant`) use
+/// blocking `send().await` to guarantee delivery even when the worker
+/// mailbox is full — `SessionStarted` (writes external_id) and
+/// `TurnComplete` (writes terminal status) are correctness-critical and
+/// silently dropping either leaves the conversation row in a permanently
+/// wrong state. Filtering keeps the queue from filling on noise traffic
+/// so the blocking path is rarely exercised.
 ///
 /// The `subscribe()` call happens here, before the future is returned, so any
 /// events emitted between this call and the first poll are buffered by the
@@ -318,13 +350,21 @@ pub fn lifecycle_subscriber_task(
     let metrics = Arc::clone(bus.metrics());
     async move {
         // connection_id → worker mailbox. Workers are spawned lazily on the
-        // connection's first event and torn down after a terminal event by
-        // dropping the sender (worker drains its queue and exits).
+        // connection's first relevant event and torn down after a terminal
+        // event by dropping the sender (worker drains its queue and exits).
         let mut workers: HashMap<String, mpsc::Sender<Arc<EventEnvelope>>> =
             HashMap::new();
         loop {
             match rx.recv().await {
                 Ok(envelope_arc) => {
+                    // Fast-path filter: skip events the worker would no-op.
+                    // Avoids spawning a worker for connections that only emit
+                    // high-frequency noise and avoids crowding existing
+                    // workers' mailboxes.
+                    if !is_lifecycle_relevant(&envelope_arc.payload) {
+                        continue;
+                    }
+
                     let conn_id = envelope_arc.connection_id.clone();
                     let is_terminal = matches!(
                         &envelope_arc.payload,
@@ -345,65 +385,45 @@ pub fn lifecycle_subscriber_task(
                         tx
                     });
 
+                    // Two-phase send: try non-blocking first (the common
+                    // case), only `await` when the mailbox is actually full.
+                    // Counts queue-full as back-pressure observation rather
+                    // than a drop event — nothing is dropped, the dispatcher
+                    // just waits for the worker to make room.
+                    let send_result = match tx.try_send(envelope_arc) {
+                        Ok(()) => Ok(()),
+                        Err(mpsc::error::TrySendError::Full(env)) => {
+                            metrics
+                                .worker_queue_full_count
+                                .fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[lifecycle][WARN] worker queue full for \
+                                 {conn_id}, awaiting drain (back-pressure)"
+                            );
+                            tx.send(env).await.map_err(|_| ())
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+                    };
+
+                    if send_result.is_err() {
+                        // Worker exited unexpectedly (panic). Clean up the
+                        // stale entry so the next relevant event respawns.
+                        workers.remove(&conn_id);
+                        continue;
+                    }
+
                     if is_terminal {
-                        // Terminal events drive the conversation row's final
-                        // status transition (InProgress → Cancelled via the
-                        // cached `CachedConn`). Dropping one means the row
-                        // stays stuck on InProgress, so we MUST deliver even
-                        // if the worker mailbox is currently full. Awaiting
-                        // `send` blocks the dispatcher until the worker drains
-                        // enough to make room — bounded by the worker's DB
-                        // throughput (typically <1s under SQLite contention).
-                        // Other connections' workers are unaffected because
-                        // each owns its own mailbox.
-                        if tx.send(envelope_arc).await.is_err() {
-                            // Worker exited between or_insert_with and send
-                            // (panic recovery edge). Clean up the stale entry;
-                            // the conversation row is already in whatever
-                            // state the prior CachedConn drained it to.
-                            workers.remove(&conn_id);
-                        } else {
-                            // Drop the sender; worker drains remaining queue
-                            // then exits. Releases the `CachedConn` (state
-                            // Arc + emitter) it was holding.
-                            workers.remove(&conn_id);
-                        }
-                    } else if let Err(e) = tx.try_send(envelope_arc) {
-                        match e {
-                            mpsc::error::TrySendError::Full(_) => {
-                                // Non-terminal event jammed behind a slow DB
-                                // write. Most non-terminal payloads (Content
-                                // Delta, ToolCall*, PermissionRequest) are
-                                // O(1) no-ops in the worker — only Session
-                                // Started / TurnComplete write — so the
-                                // dropped event is overwhelmingly noise.
-                                // Counted on the metric so operators can
-                                // distinguish "bus overload" (lagged_count)
-                                // from "single connection stalled"
-                                // (worker_queue_full_count).
-                                metrics
-                                    .worker_queue_full_count
-                                    .fetch_add(1, Ordering::Relaxed);
-                                eprintln!(
-                                    "[lifecycle][WARN] worker queue full for \
-                                     {conn_id}, dropping non-terminal event"
-                                );
-                            }
-                            mpsc::error::TrySendError::Closed(_) => {
-                                // Worker already exited (terminal event
-                                // processed earlier in this loop). Stale
-                                // mailbox; clean up so the next event for
-                                // this conn spawns a fresh worker.
-                                workers.remove(&conn_id);
-                            }
-                        }
+                        // Drop the sender; worker drains the queue then
+                        // exits. Releases the per-connection `CachedConn`
+                        // (state Arc + emitter) the worker was holding.
+                        workers.remove(&conn_id);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Lagged at the bus level (not per-connection). With the
-                    // dispatcher now non-blocking on DB writes, this should
-                    // only fire under genuine emit-rate spikes — not because
-                    // of a slow consumer.
+                    // Lagged at the bus level. Now that the dispatcher
+                    // filters and only blocks on the rare relevant events,
+                    // this should only fire under genuine emit-rate spikes
+                    // exceeding the 4096 broadcast capacity.
                     eprintln!(
                         "[lifecycle][WARN] internal bus lagged, dropped {skipped} events \
                          (emit rate exceeded broadcast capacity)"
@@ -899,6 +919,322 @@ mod tests {
         assert!(
             reloaded.external_id.is_none(),
             "non-SessionStarted events must not write external_id"
+        );
+    }
+
+    // ── Dispatcher-level regression coverage ─────────────────────────────
+    //
+    // These exercise the full `lifecycle_subscriber_task` (bus → filter →
+    // dispatcher → per-conn worker → DB) so the integration between the
+    // filter predicate and the worker's match arms cannot silently drift.
+
+    use crate::acp::internal_bus::{EventBusMetrics, InternalEventBus};
+    use std::time::Duration;
+
+    /// Predicate must accept exactly the event types the worker handles.
+    /// If a future worker arm starts caring about a new event type without
+    /// updating `is_lifecycle_relevant`, this test catches the drift.
+    #[test]
+    fn is_lifecycle_relevant_matches_worker_arms() {
+        // Accepted (worker has dedicated handling):
+        assert!(is_lifecycle_relevant(&AcpEvent::SessionStarted {
+            session_id: "s".into(),
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::TurnComplete {
+            session_id: "s".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "claude_code".into(),
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
+            conversation_id: 1,
+            folder_id: 1,
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Disconnected,
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::Error {
+            message: "boom".into(),
+            agent_type: "claude_code".into(),
+            code: None,
+        }));
+
+        // Rejected (worker no-ops on these — must not enter the queue):
+        assert!(!is_lifecycle_relevant(&AcpEvent::ContentDelta {
+            text: "x".into(),
+        }));
+        assert!(!is_lifecycle_relevant(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Connected,
+        }));
+        assert!(!is_lifecycle_relevant(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        }));
+    }
+
+    /// Poll the conversation row's status until it matches `expected` or
+    /// the timeout elapses. Used because the dispatcher exits as soon as
+    /// the bus closes, but its workers may still be draining queued events
+    /// when `dispatcher.await` returns.
+    async fn poll_status(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+        expected: ConversationStatus,
+        timeout: Duration,
+    ) -> ConversationStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let observed = read_row_status(db, conversation_id).await;
+            if observed == expected || std::time::Instant::now() >= deadline {
+                return observed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn poll_external_id(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+        expected: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let observed = conversation_service::get_by_id(&db.conn, conversation_id)
+                .await
+                .unwrap()
+                .external_id;
+            if observed.as_deref() == Some(expected)
+                || std::time::Instant::now() >= deadline
+            {
+                return observed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Filter must keep high-frequency events from spawning a worker or
+    /// reaching `handle_event_with_retry`. Verified by emitting only
+    /// ContentDelta and asserting the conversation row stays untouched.
+    #[tokio::test]
+    async fn dispatcher_filter_drops_high_frequency_events_at_source() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/disp-filter").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics.clone()));
+
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+        ));
+
+        // Subscribe AFTER spawn would race; the bus's broadcast channel
+        // requires a receiver to count. The dispatcher subscribes
+        // synchronously inside `lifecycle_subscriber_task`, so by the time
+        // `tokio::spawn` returns, the receiver IS registered.
+        for i in 0..50 {
+            bus.send(Arc::new(EventEnvelope {
+                seq: i,
+                connection_id: "c1".to_string(),
+                payload: AcpEvent::ContentDelta {
+                    text: format!("delta {i}"),
+                },
+            }));
+        }
+
+        // Close the bus to drain the dispatcher.
+        drop(bus);
+        let _ = dispatcher.await;
+        // Brief settle for any worker that might have spawned.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let row = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert!(
+            row.external_id.is_none(),
+            "filter must keep ContentDelta from triggering DB writes"
+        );
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::InProgress,
+            "row must be untouched"
+        );
+    }
+
+    /// Happy-path through the full dispatcher → worker → DB chain.
+    /// SessionStarted writes external_id; TurnComplete{end_turn} flips the
+    /// row to PendingReview. Both must land.
+    #[tokio::test]
+    async fn dispatcher_delivers_session_started_and_turn_complete_to_db() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/disp-happy").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+        ));
+
+        bus.send(Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::SessionStarted {
+                session_id: "ext-final".into(),
+            },
+        }));
+        bus.send(Arc::new(EventEnvelope {
+            seq: 2,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-final".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+            },
+        }));
+
+        let observed_external = poll_external_id(
+            &db,
+            conv.id,
+            "ext-final",
+            Duration::from_millis(500),
+        )
+        .await;
+        let observed_status =
+            poll_status(&db, conv.id, ConversationStatus::PendingReview, Duration::from_millis(500))
+                .await;
+
+        drop(bus);
+        let _ = dispatcher.await;
+
+        assert_eq!(observed_external.as_deref(), Some("ext-final"));
+        assert_eq!(observed_status, ConversationStatus::PendingReview);
+    }
+
+    /// Burst: emit a long sequence of relevant events followed by a
+    /// `TurnComplete{end_turn}`. With the prior `try_send` + drop logic,
+    /// any sufficiently-long burst could push the TurnComplete off the
+    /// worker mailbox, leaving the row at InProgress. With the blocking
+    /// `send().await` fallback the dispatcher waits for the worker to
+    /// drain — so the TurnComplete MUST land regardless of burst size.
+    ///
+    /// The N=200 burst exceeds `WORKER_QUEUE_CAPACITY` (64) so the
+    /// dispatcher exercises the `try_send → send.await` fallback path.
+    /// Even if SQLite serves writes quickly enough to keep the queue
+    /// shallow most of the time, exceeding capacity at any instant
+    /// triggers the back-pressure code path that we're regressing on.
+    #[tokio::test]
+    async fn dispatcher_delivers_turn_complete_after_relevant_event_burst() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/disp-burst").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "c1".to_string(),
+                fake_connection_with_state("c1", Some(conv.id)),
+            );
+        }
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+        ));
+
+        // Burst of 200 SessionStarted events (each writes external_id).
+        // 200 > WORKER_QUEUE_CAPACITY (64) ensures the back-pressure path
+        // is exercised.
+        for i in 1..=200u64 {
+            bus.send(Arc::new(EventEnvelope {
+                seq: i,
+                connection_id: "c1".to_string(),
+                payload: AcpEvent::SessionStarted {
+                    session_id: format!("ext-{i:03}"),
+                },
+            }));
+        }
+
+        // The critical event: TurnComplete that MUST flip the row.
+        bus.send(Arc::new(EventEnvelope {
+            seq: 201,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-200".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+            },
+        }));
+
+        // Wait for the worker to fully drain. The TurnComplete is at the
+        // tail of the queue, so observing PendingReview proves nothing
+        // before it was dropped.
+        let observed = poll_status(
+            &db,
+            conv.id,
+            ConversationStatus::PendingReview,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        drop(bus);
+        let _ = dispatcher.await;
+
+        assert_eq!(
+            observed,
+            ConversationStatus::PendingReview,
+            "TurnComplete at the tail of a 200-event burst MUST be delivered \
+             (regression test for `try_send` drop bug)"
         );
     }
 }

@@ -22,7 +22,34 @@ const READY_TIMEOUT_MS = 5_000
 const WS_DISCONNECTED_CHANNEL = "__disconnected__"
 const WS_UNAUTHORIZED_CHANNEL = "__unauthorized__"
 
-interface WsEnvelope {
+// Two wire shapes flow on the same `remote-ws-event-{id}` Tauri event:
+//   1. Legacy `{channel, payload}` envelopes from the WebEventBroadcaster
+//      firehose (`__ready__`, folder/app channels, etc.).
+//   2. Top-level attach-protocol frames `{type, ...}` from the per-connection
+//      WS attach forwarders (`ServerMsg` in `web/ws_attach.rs`).
+// `forward_text_message` in the Rust proxy passes the parsed JSON through
+// without re-shaping, so the handler must discriminate on which top-level
+// field is present. Using `unknown` here forces that discrimination at the
+// call site rather than silently destructuring `undefined`.
+type WsFrame = unknown
+
+const ATTACH_FRAME_TYPES = new Set([
+  "snapshot",
+  "replay",
+  "event",
+  "detached",
+  "pong",
+])
+
+function isAttachFrame(
+  frame: unknown
+): frame is { type: string; [k: string]: unknown } {
+  if (!frame || typeof frame !== "object") return false
+  const t = (frame as { type?: unknown }).type
+  return typeof t === "string" && ATTACH_FRAME_TYPES.has(t)
+}
+
+interface LegacyEnvelope {
   channel: string
   payload: unknown
 }
@@ -230,7 +257,7 @@ export class RemoteDesktopTransport implements Transport {
     this.wsStarted = true
 
     try {
-      this.unlistenWsEvent = await listen<WsEnvelope>(
+      this.unlistenWsEvent = await listen<WsFrame>(
         `remote-ws-event-${this.config.id}`,
         (event) => this.handleWsEvent(event.payload)
       )
@@ -262,23 +289,24 @@ export class RemoteDesktopTransport implements Transport {
     }
   }
 
-  private handleWsEvent(envelope: WsEnvelope) {
+  private handleWsEvent(frame: WsFrame) {
     if (this.destroyed) return
 
-    const { channel, payload } = envelope
-    // Attach-protocol frames arrive shaped like
-    //   { channel: <discarded>, payload: { type: "snapshot"|"event"|... } }
-    // The proxy's `forward_text_message` parses them as the legacy
-    // `{channel, payload}` envelope and re-emits as a Tauri event. Routing
-    // here checks payload.type to dispatch to the EventStream.
-    if (
-      payload &&
-      typeof payload === "object" &&
-      "type" in (payload as object)
-    ) {
-      this.eventStreamInstance?.handleServerFrame(payload)
+    // Attach-protocol frames are top-level `{ type, ... }` (the Rust proxy
+    // forwards the WS text frame as-is, so the wire shape `ServerMsg` from
+    // `web/ws_attach.rs` arrives unwrapped). Discriminate by which top-level
+    // field is present — this MUST mirror `WebTransport.onmessage`, otherwise
+    // remote-desktop loses every snapshot/replay/event frame and the
+    // attach-protocol UI silently goes dark.
+    if (isAttachFrame(frame)) {
+      this.eventStreamInstance?.handleServerFrame(frame)
       return
     }
+
+    if (!frame || typeof frame !== "object") return
+    const { channel, payload } = frame as LegacyEnvelope
+    if (typeof channel !== "string") return
+
     if (channel === WS_READY_CHANNEL) {
       this.wsOpen = true
       this.readyResolve()
