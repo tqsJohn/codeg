@@ -678,6 +678,14 @@ pub fn build_router(
             "/weixin_check_qrcode",
             post(handlers::chat_channel::weixin_check_qrcode),
         )
+        // GET /api/chat-channels/messages/:log_id/wx-status — re-query
+        // Server酱 for the upstream WeChat delivery status of a pushed
+        // message. Uses RESTful path params (vs the legacy `/snake_case`
+        // POST endpoints above) because it's idempotent + cacheable.
+        .route(
+            "/chat-channels/messages/:log_id/wx-status",
+            get(handlers::chat_channel::query_server_chan_status_handler),
+        )
         // ─── Model Providers ───
         .route(
             "/list_model_providers",

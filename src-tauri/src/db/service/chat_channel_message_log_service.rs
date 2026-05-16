@@ -2,7 +2,7 @@ use chrono::Utc;
 use sea_orm::prelude::DateTimeUtc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Set,
+    IntoActiveModel, QueryFilter, QueryOrder, Set,
 };
 
 use crate::db::entities::chat_channel_message_log;
@@ -44,6 +44,36 @@ pub async fn list_by_channel(
         .paginate(conn, limit)
         .fetch_page(offset / limit)
         .await?)
+}
+
+/// Look up a single message log row by primary key.
+pub async fn get_by_id(
+    conn: &DatabaseConnection,
+    id: i32,
+) -> Result<Option<chat_channel_message_log::Model>, DbError> {
+    Ok(chat_channel_message_log::Entity::find_by_id(id)
+        .one(conn)
+        .await?)
+}
+
+/// Persist the upstream WeChat delivery status reported by Server酱's
+/// `push?id=&readkey=` endpoint into the existing `error_detail` column
+/// (re-used as a generic "delivery status detail" slot so we avoid a
+/// schema migration).
+pub async fn update_wx_status(
+    conn: &DatabaseConnection,
+    id: i32,
+    wx_status: &str,
+) -> Result<(), DbError> {
+    let model = chat_channel_message_log::Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::Migration(format!("chat channel message log not found: {id}")))?;
+
+    let mut active = model.into_active_model();
+    active.error_detail = Set(Some(format!("wxstatus:{wx_status}")));
+    active.update(conn).await?;
+    Ok(())
 }
 
 pub async fn cleanup_old_logs(

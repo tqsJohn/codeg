@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{extract::Extension, Json};
+use axum::{
+    extract::{Extension, Path},
+    Json,
+};
 use serde::Deserialize;
 
 use crate::app_error::AppCommandError;
@@ -270,5 +273,20 @@ pub async fn weixin_check_qrcode(
 ) -> Result<Json<WeixinQrcodeStatusPublic>, AppCommandError> {
     let result =
         cc_commands::weixin_check_qrcode_core(&state.db, params.channel_id, &params.qrcode).await?;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Server酱 push status query
+// ---------------------------------------------------------------------------
+
+/// `GET /api/chat-channels/messages/:log_id/wx-status` — re-query Server酱
+/// for the upstream WeChat delivery status of a previously-pushed message
+/// and persist the result back into the message log.
+pub async fn query_server_chan_status_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(log_id): Path<i32>,
+) -> Result<Json<Option<String>>, AppCommandError> {
+    let result = cc_commands::query_server_chan_status_core(&state.db, log_id).await?;
     Ok(Json(result))
 }

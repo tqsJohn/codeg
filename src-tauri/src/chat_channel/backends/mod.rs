@@ -1,4 +1,5 @@
 pub mod lark;
+pub mod serverchan;
 pub mod telegram;
 pub mod weixin;
 
@@ -59,6 +60,20 @@ pub fn create_backend(
                 cfg.app_id,
                 token,
                 cfg.chat_id,
+            )))
+        }
+        ChannelType::ServerChan => {
+            let cfg: ServerChanConfig = serde_json::from_value(config.clone()).map_err(|e| {
+                ChatChannelError::ConfigurationInvalid(format!("Invalid ServerChan config: {e}"))
+            })?;
+            // SendKey itself comes from keyring (`token`); empty-token
+            // already short-circuits at the caller (auto_connect /
+            // connect_chat_channel_core), so no extra check here.
+            Ok(Box::new(serverchan::ServerChanBackend::new(
+                channel_id,
+                token,
+                cfg.default_channel,
+                cfg.noip,
             )))
         }
     }

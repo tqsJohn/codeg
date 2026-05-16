@@ -339,6 +339,110 @@ pub async fn weixin_get_qrcode_core() -> Result<WeixinQrcodeInfo, AppCommandErro
         .map_err(AppCommandError::from)
 }
 
+// ---------------------------------------------------------------------------
+// Server酱 status query
+// ---------------------------------------------------------------------------
+
+/// Look up the WeChat delivery status of a previously-pushed Server酱
+/// message and write it back into the `chat_channel_message_log` row.
+///
+/// Returns `Ok(None)` when:
+///   * the log row does not exist or is not a `server_chan` message
+///   * the SentMessageId is not in the expected `pushid|readkey` shape
+///   * Server酱 has not yet produced a `wxstatus` field for this push
+///
+/// Returns `Ok(Some(status))` and persists the value when Server酱
+/// reports a non-empty `data.wxstatus`.
+pub async fn query_server_chan_status_core(
+    db: &AppDatabase,
+    log_id: i32,
+) -> Result<Option<String>, AppCommandError> {
+    // 1) Load the log row and verify it belongs to a server_chan channel.
+    let log = chat_channel_message_log_service::get_by_id(&db.conn, log_id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found(format!("Message log {log_id} not found")))?;
+
+    let channel = chat_channel_service::get_by_id(&db.conn, log.channel_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let Some(channel) = channel else {
+        return Ok(None);
+    };
+    if channel.channel_type != "server_chan" {
+        return Ok(None);
+    }
+
+    // 2) SentMessageId is stored inside `content_preview` style by the
+    //    dispatcher; the canonical place however is the structured
+    //    `SentMessageId(pushid|readkey)` returned by the backend. In the
+    //    current schema we re-derive it from the log row's preview/error
+    //    slot: callers writing Server酱 logs persist `pushid|readkey`
+    //    into `content_preview`. If the format does not match we treat
+    //    it as "no info yet" and return None.
+    let raw = &log.content_preview;
+    let (pushid, readkey) = match split_pushid_readkey(raw) {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+
+    // 3) Query Server酱's status endpoint. Failures are surfaced as
+    //    network errors so the UI can retry; "no wxstatus yet" is not
+    //    an error.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppCommandError::network("Failed to build HTTP client").with_detail(e.to_string()))?;
+
+    let url = format!(
+        "https://sctapi.ftqq.com/push?id={}&readkey={}",
+        pushid, readkey
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppCommandError::network("Server酱 status request failed").with_detail(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(AppCommandError::network(format!(
+            "Server酱 status HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppCommandError::network("Server酱 status decode failed").with_detail(e.to_string()))?;
+
+    let wxstatus = body
+        .pointer("/data/wxstatus")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref status) = wxstatus {
+        chat_channel_message_log_service::update_wx_status(&db.conn, log_id, status)
+            .await
+            .map_err(AppCommandError::from)?;
+    }
+
+    Ok(wxstatus)
+}
+
+/// Split a `pushid|readkey` SentMessageId-shaped string. Returns `None`
+/// if either side is empty or the separator is missing — the caller
+/// treats that as "no Server酱 status info available".
+fn split_pushid_readkey(s: &str) -> Option<(&str, &str)> {
+    let (pushid, readkey) = s.split_once('|')?;
+    if pushid.is_empty() || readkey.is_empty() {
+        return None;
+    }
+    Some((pushid, readkey))
+}
+
 pub async fn weixin_check_qrcode_core(
     db: &AppDatabase,
     channel_id: i32,
@@ -594,4 +698,13 @@ pub async fn weixin_check_qrcode(
     qrcode: String,
 ) -> Result<WeixinQrcodeStatusPublic, AppCommandError> {
     weixin_check_qrcode_core(&db, channel_id, &qrcode).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn query_server_chan_status(
+    db: tauri::State<'_, AppDatabase>,
+    log_id: i32,
+) -> Result<Option<String>, AppCommandError> {
+    query_server_chan_status_core(&db, log_id).await
 }

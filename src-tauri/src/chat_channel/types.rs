@@ -6,6 +6,7 @@ pub enum ChannelType {
     Lark,
     Telegram,
     Weixin,
+    ServerChan,
 }
 
 // ── Per-channel strong typed configs ──
@@ -26,12 +27,32 @@ pub struct WeixinConfig {
     pub base_url: String,
 }
 
+/// Server酱 (Server Chan) push channel configuration.
+///
+/// Server酱 is a one-way push webhook — there is no incoming stream.
+/// `default_channel` optionally pins one or more sub-channels (up to 2,
+/// pipe-separated, e.g. `"9|66"`) so the push is delivered through them;
+/// when `None`, the push follows the channel order configured on the
+/// Server酱 website.
+///
+/// `noip = Some(true)` tells Server酱 to omit the caller IP from the
+/// outgoing notification — useful when codeg-server is behind a NAT/CDN
+/// and the upstream IP would be misleading.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerChanConfig {
+    #[serde(default)]
+    pub default_channel: Option<String>,
+    #[serde(default)]
+    pub noip: Option<bool>,
+}
+
 impl std::fmt::Display for ChannelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelType::Lark => write!(f, "lark"),
             ChannelType::Telegram => write!(f, "telegram"),
             ChannelType::Weixin => write!(f, "weixin"),
+            ChannelType::ServerChan => write!(f, "server_chan"),
         }
     }
 }
