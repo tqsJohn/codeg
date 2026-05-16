@@ -214,6 +214,9 @@ export function ChannelListTab() {
   const getChannelStatus = (id: number) =>
     statuses.find((s) => s.channel_id === id)?.status ?? "disconnected"
 
+  const getChannelTypeLabel = (type: ChannelType) =>
+    type === "server_chan" ? t("typeServerChan") : type
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center text-sm text-muted-foreground gap-2">
@@ -262,7 +265,7 @@ export function ChannelListTab() {
                       variant="outline"
                       className="text-xs inline-flex items-center gap-1"
                     >
-                      {ch.channel_type}
+                      {getChannelTypeLabel(ch.channel_type)}
                       {ch.channel_type === "weixin" && (
                         <TooltipProvider>
                           <Tooltip>

@@ -46,6 +46,8 @@ export function AddChatChannelDialog({
   const [chatId, setChatId] = useState("")
   const [appId, setAppId] = useState("")
   const [baseUrl, setBaseUrl] = useState("https://ilinkai.weixin.qq.com")
+  const [defaultChannel, setDefaultChannel] = useState("")
+  const [noip, setNoip] = useState(false)
   const [dailyReportEnabled, setDailyReportEnabled] = useState(false)
   const [dailyReportTime, setDailyReportTime] = useState("18:00")
 
@@ -56,6 +58,8 @@ export function AddChatChannelDialog({
     setChatId("")
     setAppId("")
     setBaseUrl("https://ilinkai.weixin.qq.com")
+    setDefaultChannel("")
+    setNoip(false)
     setDailyReportEnabled(false)
     setDailyReportTime("18:00")
     setError(null)
@@ -75,10 +79,18 @@ export function AddChatChannelDialog({
       return
     }
     if (channelType !== "weixin" && !token.trim()) {
-      setError(t("tokenRequired"))
+      setError(
+        channelType === "server_chan"
+          ? t("serverChanSendKeyRequired")
+          : t("tokenRequired")
+      )
       return
     }
-    if (channelType !== "weixin" && !chatId.trim()) {
+    if (
+      channelType !== "weixin" &&
+      channelType !== "server_chan" &&
+      !chatId.trim()
+    ) {
       setError(t("chatIdRequired"))
       return
     }
@@ -91,7 +103,12 @@ export function AddChatChannelDialog({
           ? JSON.stringify({ base_url: baseUrl })
           : channelType === "lark"
             ? JSON.stringify({ app_id: appId, chat_id: chatId })
-            : JSON.stringify({ chat_id: chatId })
+            : channelType === "server_chan"
+              ? JSON.stringify({
+                  default_channel: defaultChannel.trim() || undefined,
+                  noip: noip || undefined,
+                })
+              : JSON.stringify({ chat_id: chatId })
 
       const channel = await createChatChannel({
         name: name.trim(),
@@ -121,6 +138,8 @@ export function AddChatChannelDialog({
     channelType,
     appId,
     baseUrl,
+    defaultChannel,
+    noip,
     dailyReportEnabled,
     dailyReportTime,
     handleOpenChange,
@@ -158,6 +177,9 @@ export function AddChatChannelDialog({
                 <SelectItem value="telegram">Telegram</SelectItem>
                 <SelectItem value="lark">{t("lark")}</SelectItem>
                 <SelectItem value="weixin">{t("weixin")}</SelectItem>
+                <SelectItem value="server_chan">
+                  {t("typeServerChan")}
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -176,20 +198,28 @@ export function AddChatChannelDialog({
           {channelType !== "weixin" && (
             <div className="space-y-1.5">
               <label className="text-xs font-medium">
-                {channelType === "telegram" ? "Bot Token" : "App Secret"}
+                {channelType === "telegram"
+                  ? "Bot Token"
+                  : channelType === "server_chan"
+                    ? t("serverChanSendKey")
+                    : "App Secret"}
               </label>
               <Input
                 type="password"
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
                 placeholder={
-                  channelType === "telegram" ? "123456:ABC-DEF..." : "xxxxx"
+                  channelType === "telegram"
+                    ? "123456:ABC-DEF..."
+                    : channelType === "server_chan"
+                      ? "SCT..."
+                      : "xxxxx"
                 }
               />
             </div>
           )}
 
-          {channelType !== "weixin" && (
+          {channelType !== "weixin" && channelType !== "server_chan" && (
             <div className="space-y-1.5">
               <label className="text-xs font-medium">Chat ID</label>
               <Input
@@ -200,6 +230,35 @@ export function AddChatChannelDialog({
                 }
               />
             </div>
+          )}
+
+          {channelType === "server_chan" && (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">
+                  {t("serverChanDefaultChannel")}
+                </label>
+                <Input
+                  value={defaultChannel}
+                  onChange={(e) => setDefaultChannel(e.target.value)}
+                  placeholder={t("serverChanDefaultChannelPlaceholder")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("serverChanDefaultChannelHint")}
+                </p>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <label className="text-xs font-medium">
+                    {t("serverChanNoip")}
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    {t("serverChanNoipHint")}
+                  </p>
+                </div>
+                <Switch checked={noip} onCheckedChange={setNoip} />
+              </div>
+            </>
           )}
 
           {channelType === "weixin" && (

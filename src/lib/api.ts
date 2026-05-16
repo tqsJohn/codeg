@@ -1911,6 +1911,43 @@ export async function listChatChannelMessages(params: {
   })
 }
 
+/**
+ * Re-query Server酱 for the WeChat delivery status of a previously pushed
+ * message log entry. Desktop side invokes the Tauri command directly; web
+ * side hits the RESTful `GET /api/chat-channels/messages/:log_id/wx-status`
+ * endpoint (the only non-`/api/{snake_case}` POST route in the chat-channel
+ * surface — see TASK-001 backend notes). Returns the upstream `wxstatus`
+ * string when available, or `null` when Server酱 has not yet produced a
+ * status (also returned for non-`server_chan` log ids).
+ */
+export async function queryServerChanStatus(
+  logId: number
+): Promise<string | null> {
+  if (isDesktop()) {
+    return getShellTransport().call("query_server_chan_status", { logId })
+  }
+  const token = getCodegToken()
+  const res = await fetch(
+    `${window.location.origin}/api/chat-channels/messages/${logId}/wx-status`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    }
+  )
+  if (res.status === 401) {
+    redirectToCodegLogin()
+    throw new Error("Unauthorized")
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({
+      code: "network_error",
+      message: `HTTP ${res.status}`,
+    }))
+    throw err
+  }
+  return res.json()
+}
+
 export async function getChatCommandPrefix(): Promise<string> {
   return getTransport().call("get_chat_command_prefix")
 }

@@ -46,6 +46,10 @@ export function EditChatChannelDialog({
   const [chatId, setChatId] = useState(config.chat_id ?? "")
   const [appId, setAppId] = useState(config.app_id ?? "")
   const [baseUrl] = useState(config.base_url ?? "")
+  const [defaultChannel, setDefaultChannel] = useState<string>(
+    config.default_channel ?? ""
+  )
+  const [noip, setNoip] = useState<boolean>(config.noip ?? false)
   const [dailyReportEnabled, setDailyReportEnabled] = useState(
     channel.daily_report_enabled
   )
@@ -67,8 +71,20 @@ export function EditChatChannelDialog({
       setError(t("nameRequired"))
       return
     }
-    if (channel.channel_type !== "weixin" && !chatId.trim()) {
+    if (
+      channel.channel_type !== "weixin" &&
+      channel.channel_type !== "server_chan" &&
+      !chatId.trim()
+    ) {
       setError(t("chatIdRequired"))
+      return
+    }
+    if (
+      channel.channel_type === "server_chan" &&
+      !hasToken &&
+      !token.trim()
+    ) {
+      setError(t("serverChanSendKeyRequired"))
       return
     }
 
@@ -80,7 +96,12 @@ export function EditChatChannelDialog({
           ? JSON.stringify({ base_url: baseUrl })
           : channel.channel_type === "lark"
             ? JSON.stringify({ app_id: appId, chat_id: chatId })
-            : JSON.stringify({ chat_id: chatId })
+            : channel.channel_type === "server_chan"
+              ? JSON.stringify({
+                  default_channel: defaultChannel.trim() || undefined,
+                  noip: noip || undefined,
+                })
+              : JSON.stringify({ chat_id: chatId })
 
       await updateChatChannel({
         id: channel.id,
@@ -110,6 +131,9 @@ export function EditChatChannelDialog({
     channel,
     appId,
     baseUrl,
+    defaultChannel,
+    noip,
+    hasToken,
     dailyReportEnabled,
     dailyReportTime,
     onOpenChange,
@@ -150,7 +174,9 @@ export function EditChatChannelDialog({
               <label className="text-xs font-medium">
                 {channel.channel_type === "telegram"
                   ? "Bot Token"
-                  : "App Secret"}
+                  : channel.channel_type === "server_chan"
+                    ? t("serverChanSendKey")
+                    : "App Secret"}
               </label>
               <Input
                 type="password"
@@ -163,19 +189,49 @@ export function EditChatChannelDialog({
             </div>
           )}
 
-          {channel.channel_type !== "weixin" && (
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium">Chat ID</label>
-              <Input
-                value={chatId}
-                onChange={(e) => setChatId(e.target.value)}
-                placeholder={
-                  channel.channel_type === "telegram"
-                    ? "-100123456789"
-                    : "oc_xxxxx"
-                }
-              />
-            </div>
+          {channel.channel_type !== "weixin" &&
+            channel.channel_type !== "server_chan" && (
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">Chat ID</label>
+                <Input
+                  value={chatId}
+                  onChange={(e) => setChatId(e.target.value)}
+                  placeholder={
+                    channel.channel_type === "telegram"
+                      ? "-100123456789"
+                      : "oc_xxxxx"
+                  }
+                />
+              </div>
+            )}
+
+          {channel.channel_type === "server_chan" && (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">
+                  {t("serverChanDefaultChannel")}
+                </label>
+                <Input
+                  value={defaultChannel}
+                  onChange={(e) => setDefaultChannel(e.target.value)}
+                  placeholder={t("serverChanDefaultChannelPlaceholder")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("serverChanDefaultChannelHint")}
+                </p>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <label className="text-xs font-medium">
+                    {t("serverChanNoip")}
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    {t("serverChanNoipHint")}
+                  </p>
+                </div>
+                <Switch checked={noip} onCheckedChange={setNoip} />
+              </div>
+            </>
           )}
 
           {channel.channel_type === "weixin" && baseUrl && (

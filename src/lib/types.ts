@@ -1250,7 +1250,12 @@ export interface AgentInstallEvent {
 
 // ─── Chat Channels ───
 
-export type ChannelType = "lark" | "telegram" | "weixin"
+export type ChannelType = "lark" | "telegram" | "weixin" | "server_chan"
+
+export interface ServerChanConfig {
+  default_channel?: string
+  noip?: boolean
+}
 
 export type ChannelConnectionStatus =
   | "connected"
